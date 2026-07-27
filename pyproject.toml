@@ -1,0 +1,16 @@
+[project]
+name = "learn-llm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=5.0.0",
+    "jupyterlab>=4.6.1",
+    "matplotlib>=3.11.0",
+    "pandas>=3.0.3",
+    "safetensors>=0.8.0",
+    "tiktoken>=0.13.0",
+    "torch>=2.12.1",
+    "transformers>=5.14.1",
+]
