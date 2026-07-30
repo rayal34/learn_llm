@@ -1,6 +1,10 @@
 TOTAL_BATCH_SIZE = 524288  # in tokens, 2 ** 19 (a "nice" number)
-B = 2  # micro batch size
-T = 1024  # sequence length
+BATCH_SIZE = 2  # micro batch size
+CONTEXT_LENGTH = 1024  # sequence length
+VOCAB_SIZE = (
+    50304  # gpt vocab size = 50257, padded to 50304 to make it a multiple of 64
+)
+
 
 MAX_LR = 6e-4
 MIN_LR = MAX_LR * 0.1

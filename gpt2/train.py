@@ -16,9 +16,19 @@ use_ddp, ddp_rank, ddp_local_rank, ddp_world_size, device, master_process = (
 
 utils.seed_everything(1337)
 
-assert constants.TOTAL_BATCH_SIZE % (constants.B * constants.T * ddp_world_size) == 0
+assert (
+    constants.TOTAL_BATCH_SIZE
+    % (constants.BATCH_SIZE * constants.CONTEXT_LENGTH * ddp_world_size)
+    == 0
+)
 grad_accumulation_steps = constants.TOTAL_BATCH_SIZE // (
-    constants.B * constants.T * ddp_world_size
+    constants.BATCH_SIZE * constants.CONTEXT_LENGTH * ddp_world_size
+)
+tokens_per_step = (
+    grad_accumulation_steps
+    * ddp_world_size
+    * constants.BATCH_SIZE
+    * constants.CONTEXT_LENGTH
 )
 if master_process:
     print(
@@ -26,15 +36,15 @@ if master_process:
     )
 
 train_loader = utils.DataLoaderLite(
-    constants.B, constants.T, ddp_rank, ddp_world_size, "train"
+    constants.BATCH_SIZE, constants.CONTEXT_LENGTH, ddp_rank, ddp_world_size, "train"
 )
 val_loader = utils.DataLoaderLite(
-    constants.B, constants.T, ddp_rank, ddp_world_size, "valid"
+    constants.BATCH_SIZE, constants.CONTEXT_LENGTH, ddp_rank, ddp_world_size, "valid"
 )
 
 torch.set_float32_matmul_precision("high")
 
-model = GPT(GPTConfig(vocab_size=50304))
+model = GPT(GPTConfig(vocab_size=constants.VOCAB_SIZE))
 model.to(device)
 if "cuda" in device:
     model = torch.compile(model)
