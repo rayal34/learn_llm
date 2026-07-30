@@ -71,7 +71,9 @@ for step in range(constants.MAX_STEPS):
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device, dtype=torch.bfloat16):
                     logits = model(x)
-                    loss = F.cross_entropy(logits, y)
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.shape[-1]), y.view(-1)
+                    )
 
                 val_loss += loss.detach()
 
@@ -98,7 +100,7 @@ for step in range(constants.MAX_STEPS):
             model.require_backward_grad_sync = micro_step == grad_accumulation_steps - 1
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits = model(x)
-            loss = F.cross_entropy(logits, y)
+            loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
         loss = loss / grad_accumulation_steps
         train_loss += loss.detach()
 
