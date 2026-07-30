@@ -4,7 +4,7 @@ import os
 import time
 from dataclasses import dataclass
 
-import tiktoken
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -21,7 +21,7 @@ class MLP(nn.Module):
         )  # the 4x factor is from the original attention paper.  4 x d_model = d_ff
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(4 * config.n_embed, config.n_embed)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.c_proj.NANOGPT_SCALE_INIT = 1  # type: ignore
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -38,7 +38,7 @@ class CausalSelfAttention(nn.Module):
         # 3 is for the kvq
         self.c_attn = nn.Linear(config.n_embed, 3 * config.n_embed)
         self.c_proj = nn.Linear(config.n_embed, config.n_embed)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.c_proj.NANOGPT_SCALE_INIT = 1  # type: ignore
         self.n_head = config.n_head
         self.n_embed = config.n_embed
         self.register_buffer(
@@ -121,7 +121,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
 
         # weight sharing
-        self.transformer.wte.weight = self.lm_head.weight
+        self.transformer["wte"].weight = self.lm_head.weight
 
         # init params
         self.apply(self._init_weights)
@@ -141,15 +141,17 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         # idx shape (B, T)
-        B, T = idx.shape
+        _, T = idx.shape
         assert T <= self.config.block_size
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        pos_emb = self.transformer.wpe(pos)  # (T, n_embed)
-        tok_emb = self.transformer.wte(idx)  # (B, T, n_embed)
+        # (T, n_embed)
+        pos_emb = self.transformer["wpe"](pos)
+        # (B, T, n_embed)
+        tok_emb = self.transformer["wte"](idx)
         x = pos_emb + tok_emb
-        for block in self.transformer.h:
+        for block in self.transformer["h"]:  # type: ignore
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.transformer["ln_f"](x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
         loss = None
         if targets is not None:
@@ -176,15 +178,13 @@ class GPT(nn.Module):
         config = GPTConfig(**config_args)
         model = GPT(config)
         sd = model.state_dict()
-        sd_keys = [
-            k for k in sd.keys() if not k.endswith(".attn.bias")
-        ]  # discard the tril
+        sd_keys = [k for k in sd if not k.endswith(".attn.bias")]  # discard the tril
 
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
         sd_keys_hf = [
             k
-            for k in sd_hf.keys()
+            for k in sd_hf
             if not k.endswith(".attn.masked_bias") or not k.endswith("attn.bias")
         ]
         transposed = [
@@ -238,22 +238,34 @@ class GPT(nn.Module):
         return optimizer
 
 
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
+
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {"train", "val"}
 
-        with open("data.txt", "r") as f:
-            text = f.read()
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = sorted([shard for shard in shards if split in shard])
+        shards = [os.path.join(data_root, shard) for shard in shards]
+        self.shards = shards
+        assert len(shards) > 0
+        if master_process:
+            print(f"Found {len(shards)} for split {split}")
+        self.reset()
 
-        self.current_position = B * T * process_rank
+    def reset(self):
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = B * T * self.process_rank
 
     def next_batch(self):
         buf = self.tokens[
@@ -265,12 +277,14 @@ class DataLoaderLite:
         if self.current_position + (self.B * self.T * self.num_processes + 1) > len(
             self.tokens
         ):
-            self.current_position = 0
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
 
         return x, y
 
 
-ddp = int(os.environ.get("RANK", -1)) != -1
+ddp = int(os.environ.get("RANK", "-1")) != -1
 if ddp:
     assert torch.cuda.is_available()
     init_process_group(backend="nccl")
@@ -310,7 +324,9 @@ if master_process:
         f"total desired batch_size: {total_batch_size}, gradient accumulation steps: {grad_accum_steps}"
     )
 
-train_loader = DataLoaderLite(B, T, ddp_rank, ddp_world_size)
+train_loader = DataLoaderLite(B, T, ddp_rank, ddp_world_size, split="train")
+val_loader = DataLoaderLite(B, T, ddp_rank, ddp_world_size, split="val")
+
 torch.set_float32_matmul_precision("high")
 
 # create model
@@ -320,13 +336,12 @@ if "cuda" in device:
     model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module if ddp else model
+raw_model = model.module if ddp else model  # type: ignore
 
-max_steps = 1000
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715  # 375e6 warmup tokens (from gpt paper) / 2e19 = 715
+max_steps = 19073  # 10e9 (10B) tokens, roughly, 2 ** 19 tokens/step (batch size). 10e9 / 2 ** 19 = 19073
 
 
 def get_lr(it):
@@ -341,11 +356,53 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 
-optimizer = raw_model.configure_optimizers(
+optimizer = raw_model.configure_optimizers(  # type: ignore
     weight_decay=0.1, learning_rate=6e-4, device=device
 )
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "log.txt")
+with open(log_file, "w"):
+    pass
+
 for step in range(max_steps):
     t0 = time.time()
+    last_step = step == max_steps - 1
+
+    if step % 100 == 0:
+        model.eval()  # type: ignore
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 5000 == 0 or last_step):
+                model_checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                model_checkpoint = {
+                    "model": raw_model.state_dict(),  # type: ignore
+                    "config": raw_model.config,  # type: ignore
+                    "step": step,
+                    "val_loss": val_loss_accum.item(),
+                }
+                torch.save(model_checkpoint, model_checkpoint_path)
+
+                optimizer_checkpoint_path = os.path.join(log_dir, f"opt_{step:05d}.pt")
+                opt_checkpoint = {"optimizer": optimizer.state_dict(), "step": step}
+                torch.save(opt_checkpoint, optimizer_checkpoint_path)
+
+    model.train()  # type: ignore
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
@@ -356,18 +413,18 @@ for step in range(max_steps):
         loss = loss / grad_accum_steps  # to account for the lack of mean reduction
         loss_accum += loss.detach()
         if ddp:
-            model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            model.require_backward_grad_sync = micro_step == grad_accum_steps - 1  # type: ignore
         loss.backward()
 
-    # get the average loss across all the processes
-    if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # type:ignore
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
 
     optimizer.step()
+    if device == "cuda":
+        torch.cuda.synchronize()
+
     t1 = time.time()
     dt = t1 - t0
     tokens_processed = (
@@ -376,37 +433,8 @@ for step in range(max_steps):
     tokens_per_sec = tokens_processed / (t1 - t0)
     if master_process:
         print(
-            f"step: {step} | loss: {loss_accum.item():.6f} | lr: {lr} |  norm: {norm:.4f} | dt: {dt:.2f} | tok/sec: {tokens_per_sec:.2f}"
+            f"step: {step} | loss: {loss_accum:.6f} | lr: {lr} |  norm: {norm:.4f} | dt: {dt * 1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
         )
 
 if ddp:
     destroy_process_group()
-# num_return_sequences = 5
-# max_length = 30
-# model = GPT.from_pretrained("gpt2")
-# model = GPT(GPTConfig())
-# model.eval()
-# model.to(device)
-# tokens = enc.encode("Hi, I'm a student from ")
-# tokens = torch.tensor(tokens, dtype=torch.long)
-# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-# x = tokens.to(device)
-# torch.manual_seed(42)
-# if device == "cuda":
-#     torch.cuda.manual_seed(42)
-# elif device == "mps":
-#     torch.mps.manual_seed(42)
-
-
-# while x.shape[1] < max_length:
-#     with torch.no_grad():
-#         logits = model(x)  # (B, T, vocab_size)
-#         logits = logits[:, -1, :]  # (B, vocab_size)
-#         probs = F.softmax(logits, dim=-1)
-#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)  # (B, 50)
-#         ix = torch.multinomial(topk_probs, 1)  # (B, 1)
-#         xcol = torch.gather(topk_indices, -1, ix)  # gather the selected indices
-#         x = torch.cat((x, xcol), dim=1)
-
-# for row in x:
-#     print(">", enc.decode(row.tolist()))

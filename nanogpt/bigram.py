@@ -1,5 +1,5 @@
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.nn import functional as F
 
 batch_size = 32
@@ -16,7 +16,7 @@ torch.manual_seed(1337)
 with open("data.txt", "r", encoding="utf-8") as f:
     text = f.read()
 
-chars = sorted(list(set(text)))
+chars = sorted(set(text))
 vocab_size = len(chars)
 stoi, itos = {}, {}
 for i, char in enumerate(chars):
