@@ -36,10 +36,20 @@ if master_process:
     )
 
 train_loader = utils.DataLoaderLite(
-    constants.DATA_ROOT, constants.BATCH_SIZE, constants.CONTEXT_LENGTH, ddp_rank, ddp_world_size, "train"
+    constants.DATA_ROOT,
+    constants.BATCH_SIZE,
+    constants.CONTEXT_LENGTH,
+    ddp_rank,
+    ddp_world_size,
+    "train",
 )
 val_loader = utils.DataLoaderLite(
-    constants.DATA_ROOT, constants.BATCH_SIZE, constants.CONTEXT_LENGTH, ddp_rank, ddp_world_size, "val"
+    constants.DATA_ROOT,
+    constants.BATCH_SIZE,
+    constants.CONTEXT_LENGTH,
+    ddp_rank,
+    ddp_world_size,
+    "val",
 )
 
 torch.set_float32_matmul_precision("high")
@@ -96,7 +106,7 @@ for step in range(constants.MAX_STEPS):
             print(f"Validation loss: {val_loss.item():.4f}")
             with open(log_file, "a") as f:
                 f.write(f"step: {step}, val_loss = {val_loss.item():.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
+            if step > 0 and (step % constants.CKPT_INTERVAL == 0 or last_step):
                 ckpt_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 utils.save_checkpoint(ckpt_path, model, optimizer, train_loader, step)
 
