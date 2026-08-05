@@ -36,10 +36,10 @@ if master_process:
     )
 
 train_loader = utils.DataLoaderLite(
-    constants.BATCH_SIZE, constants.CONTEXT_LENGTH, ddp_rank, ddp_world_size, "train"
+    constants.DATA_ROOT, constants.BATCH_SIZE, constants.CONTEXT_LENGTH, ddp_rank, ddp_world_size, "train"
 )
 val_loader = utils.DataLoaderLite(
-    constants.BATCH_SIZE, constants.CONTEXT_LENGTH, ddp_rank, ddp_world_size, "valid"
+    constants.DATA_ROOT, constants.BATCH_SIZE, constants.CONTEXT_LENGTH, ddp_rank, ddp_world_size, "val"
 )
 
 torch.set_float32_matmul_precision("high")
