@@ -86,14 +86,13 @@ def save_checkpoint(filepath, model, optimizer, train_loader, step):
 
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, data_root, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
         assert split in {"train", "val"}
 
-        data_root = "edu_fineweb10B"
         shards = os.listdir(data_root)
         shards = sorted([shard for shard in shards if split in shard])
         shards = [os.path.join(data_root, shard) for shard in shards]
