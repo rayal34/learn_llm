@@ -1,14 +1,13 @@
 import argparse
 import os
 from datetime import datetime
-from typing import cast
 
 import torch
 from torch import distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from gpt2 import utils
 from gpt2.configs import DataConfig, GPTConfig, TrainConfig
-from gpt2.models import GPT
 
 
 def main():
@@ -39,9 +38,15 @@ def main():
     else:
         wandb = None
 
-    model = utils.get_model(GPTConfig, use_ddp, ddp_local_rank, device)
-    raw_model = model.module if use_ddp else model
-    raw_model = cast(GPT, raw_model)
+    raw_model = utils.get_raw_model(GPTConfig, device)
+    torch.set_float32_matmul_precision("high")
+    if device.startswith("cuda"):
+        print("Compiling model")
+        raw_model = torch.compile(raw_model)
+    if use_ddp:
+        model = DDP(raw_model, device_ids=[ddp_local_rank])
+    else:
+        model = raw_model
 
     optimizer = raw_model.configure_optimizers(
         TrainConfig.weight_decay, TrainConfig.max_lr, device
@@ -86,10 +91,6 @@ def main():
         assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}"
         step = utils.load_checkpoint(ckpt_path, model, optimizer, train_loader, device)
 
-    if device.startswith("cuda"):
-        print("Compiling model")
-        model = torch.compile(model)
-    torch.set_float32_matmul_precision("high")
     utils.train_loop(
         TrainConfig,
         GPTConfig,

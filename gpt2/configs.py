@@ -5,10 +5,10 @@ from typing import Literal
 @dataclass
 class BaseConfig:
     @classmethod
-    def to_dict(self):
+    def to_dict(cls):
         return {
-            field.name: getattr(self, field.name)
-            for field in self.__dataclass_fields__.values()
+            field.name: getattr(cls, field.name)
+            for field in cls.__dataclass_fields__.values()
         }
 
 

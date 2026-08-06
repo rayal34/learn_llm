@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn import functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 from gpt2.configs import GPTConfig
 from gpt2.models import GPT
@@ -31,19 +30,12 @@ def compute_gradient_accumulation_steps(
     return grad_accumulation_steps
 
 
-def get_model(
+def get_raw_model(
     config: GPTConfig,
-    use_ddp: bool,
-    ddp_local_rank: int,
     device: str,
 ):
 
-    model = GPT(config)
-
-    model.to(device)
-
-    if use_ddp:
-        model = DDP(model, device_ids=[ddp_local_rank])
+    model = GPT(config).to(device)
 
     return model
 
@@ -95,17 +87,14 @@ def train_loop(
         last_step = step == max_steps - 1
 
         model.train()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         train_loss = 0.0
 
         # train
         for micro_step in range(grad_accumulation_steps):
             x, y = train_loader.next_batch()
             if device_type == "cuda":
-                x, y = (
-                    x.pin_memory().to(device, non_blocking=True),
-                    y.pin_memory().to(device, non_blocking=True),
-                )
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             else:
                 x, y = x.to(device), y.to(device)
             if use_ddp:
@@ -141,8 +130,8 @@ def train_loop(
                     x, y = val_loader.next_batch()
                     if device_type == "cuda":
                         x, y = (
-                            x.pin_memory().to(device, non_blocking=True),
-                            y.pin_memory().to(device, non_blocking=True),
+                            x.to(device, non_blocking=True),
+                            y.to(device, non_blocking=True),
                         )
                     else:
                         x, y = x.to(device), y.to(device)
@@ -230,7 +219,6 @@ def seed_everything(seed: int = 1337):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
     elif torch.backends.mps.is_available():
         torch.mps.manual_seed(seed)
 
@@ -249,8 +237,8 @@ def get_cosine_decay_lr(step, warmup_steps, max_steps, max_lr, min_lr):
 
 
 def load_tokens(filename):
-    npt = np.load(filename)
-    ptt = torch.tensor(npt, dtype=torch.long)
+    npt = np.load(filename, mmap_mode="r")
+    ptt = torch.from_numpy(npt)
     return ptt
 
 
@@ -313,6 +301,9 @@ class DataLoaderLite:
     def reset(self):
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
+        if torch.cuda.is_available():
+            self.tokens = self.tokens.pin_memory()
+
         self.base_position = 0
 
     def next_batch(self):
@@ -325,5 +316,7 @@ class DataLoaderLite:
         if self.base_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
+            if torch.cuda.is_available():
+                self.tokens = self.tokens.pin_memory()
             self.base_position = 0
         return x, y
