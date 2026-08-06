@@ -34,7 +34,7 @@ def main():
         wandb.init(
             project=wandb_project,
             name=wandb_run_name,
-            config=TrainConfig.to_dict() + GPTConfig.to_dict() + DataConfig.to_dict(),
+            config=TrainConfig.to_dict() | GPTConfig.to_dict() | DataConfig.to_dict(),
         )
     else:
         wandb = None
@@ -91,14 +91,15 @@ def main():
         model = torch.compile(model)
     torch.set_float32_matmul_precision("high")
     utils.train_loop(
-        config,
+        TrainConfig,
+        GPTConfig,
         model,
         optimizer,
         train_loader,
         val_loader,
         use_ddp,
         ddp_world_size,
-        device.split(":")[0],
+        device,
         master_process,
         log_dir,
         log_path,
