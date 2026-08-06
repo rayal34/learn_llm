@@ -1,160 +1,117 @@
+import argparse
 import os
-import time
+from datetime import datetime
 from typing import cast
 
 import torch
+import yaml
 from torch import distributed as dist
-from torch.nn import functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 
-from gpt2 import constants, utils
-from gpt2.models import GPT, GPTConfig
+from gpt2 import utils
+from gpt2.models import GPT
 
-use_ddp, ddp_rank, ddp_local_rank, ddp_world_size, device, master_process = (
-    utils.determine_ddp()
-)
 
-utils.seed_everything(1337)
-
-assert (
-    constants.TOTAL_BATCH_SIZE
-    % (constants.BATCH_SIZE * constants.CONTEXT_LENGTH * ddp_world_size)
-    == 0
-)
-grad_accumulation_steps = constants.TOTAL_BATCH_SIZE // (
-    constants.BATCH_SIZE * constants.CONTEXT_LENGTH * ddp_world_size
-)
-tokens_per_step = (
-    grad_accumulation_steps
-    * ddp_world_size
-    * constants.BATCH_SIZE
-    * constants.CONTEXT_LENGTH
-)
-if master_process:
-    print(
-        f"Total batch size: {constants.TOTAL_BATCH_SIZE}, gradient accumulation steps: {grad_accumulation_steps}"
+def main(config_file):
+    use_ddp, ddp_rank, ddp_local_rank, ddp_world_size, device, master_process = (
+        utils.determine_ddp()
     )
 
-train_loader = utils.DataLoaderLite(
-    constants.DATA_ROOT,
-    constants.BATCH_SIZE,
-    constants.CONTEXT_LENGTH,
-    ddp_rank,
-    ddp_world_size,
-    "train",
-)
-val_loader = utils.DataLoaderLite(
-    constants.DATA_ROOT,
-    constants.BATCH_SIZE,
-    constants.CONTEXT_LENGTH,
-    ddp_rank,
-    ddp_world_size,
-    "val",
-)
+    with open(config_file, "r") as f:
+        config = yaml.safe_load(f)
 
-torch.set_float32_matmul_precision("high")
+    log_dir = config["log_dir"]
+    log_file = config["log_file"]
+    log_path = os.path.join(log_dir, log_file)
 
-model = GPT(GPTConfig(vocab_size=constants.VOCAB_SIZE))
-model.to(device)
-if "cuda" in device:
-    model = torch.compile(model)
+    wandb_log = config["wandb_log"]
+    wandb_project = config["wandb_project"]
+    wandb_run_name = (
+        config["wandb_run_name"]
+        if config["wandb_run_name"] is not None
+        else f"gpt2_{datetime.now().strftime('%Y%m%d_%H%M%S')}"  # noqa: DTZ005
+    )
 
-if use_ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    if wandb_log and master_process:
+        import wandb
 
-raw_model = model.module if use_ddp else model
-raw_model = cast(GPT, raw_model)
+        wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    else:
+        wandb = None
 
-optimizer = raw_model.configure_optimizers(
-    constants.WEIGHT_DECAY, constants.MAX_LR, device
-)
+    model = utils.get_model(config, use_ddp, ddp_local_rank, device)
+    raw_model = model.module if use_ddp else model
+    raw_model = cast(GPT, raw_model)
 
-log_dir = "log"
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, "log.txt")
-with open(log_file, "w"):
-    pass
+    optimizer = raw_model.configure_optimizers(
+        config["weight_decay"], config["max_lr"], device
+    )
+    train_loader = utils.DataLoaderLite(
+        config["data_root"],
+        config["batch_size"],
+        config["context_length"],
+        ddp_rank,
+        ddp_world_size,
+        "train",
+    )
+    val_loader = utils.DataLoaderLite(
+        config["data_root"],
+        config["batch_size"],
+        config["context_length"],
+        ddp_rank,
+        ddp_world_size,
+        "val",
+    )
 
+    assert config["init_from"] in [
+        "scratch",
+        "resume_from_latest",
+        "resume_from_specific",
+    ]
+    if config["init_from"] == "scratch":
+        utils.seed_everything(1337)
+        step = 0
+        utils.init_log_file(log_dir, log_file)
 
-for step in range(constants.MAX_STEPS):
-    t0 = time.time()
-    last_step = step == constants.MAX_STEPS - 1
+    else:
+        if config["init_from"] == "resume_from_latest":
+            available_ckpts = sorted(
+                [file for file in os.listdir(config["log_dir"]) if file.endswith(".pt")]
+            )
+            ckpt_filename = available_ckpts[-1]
+        elif config["init_from"] == "resume_from_specific":
+            ckpt_filename = config["ckpt_filename_format"].format(
+                step=config["resume_ckpt_step"]
+            )
+        ckpt_path = os.path.join(config["log_dir"], ckpt_filename)
+        assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}"
+        step = utils.load_checkpoint(ckpt_path, model, optimizer, train_loader, device)
 
-    if step == constants.EVAL_INTERVAL or last_step:
-        model.eval()
-        val_loader.reset()
-        with torch.no_grad():
-            val_loss = 0.0
-            val_loss_steps = 20
-            for _ in range(val_loss_steps):
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    logits = model(x)
-                    loss = F.cross_entropy(
-                        logits.view(-1, logits.shape[-1]), y.view(-1)
-                    )
+    if device.startswith("cuda"):
+        print("Compiling model")
+        model = torch.compile(model)
+    torch.set_float32_matmul_precision("high")
+    utils.train_loop(
+        config,
+        model,
+        optimizer,
+        train_loader,
+        val_loader,
+        use_ddp,
+        ddp_world_size,
+        device.split(":")[0],
+        master_process,
+        log_dir,
+        log_path,
+        step=step,
+        wandb=wandb,
+    )
 
-                val_loss += loss.detach()
-
-            val_loss /= val_loss_steps
-
-        if use_ddp:
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-
-        if master_process:
-            print(f"Validation loss: {val_loss.item():.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"step: {step}, val_loss = {val_loss.item():.4f}\n")
-            if step > 0 and (step % constants.CKPT_INTERVAL == 0 or last_step):
-                ckpt_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                utils.save_checkpoint(ckpt_path, model, optimizer, train_loader, step)
-
-    model.train()
-    optimizer.zero_grad()
-    train_loss = 0.0
-    for micro_step in range(grad_accumulation_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        if use_ddp:
-            model.require_backward_grad_sync = micro_step == grad_accumulation_steps - 1
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits = model(x)
-            loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
-        loss = loss / grad_accumulation_steps
-        train_loss += loss.detach()
-
-        loss.backward()
     if use_ddp:
-        dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
+        dist.destroy_process_group()
 
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
-    lr = utils.get_cosine_decay_lr(
-        step,
-        constants.WARMUP_STEPS,
-        constants.MAX_STEPS,
-        constants.MAX_LR,
-        constants.MIN_LR,
-    )
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
 
-    optimizer.step()
-    if device == "cuda":
-        torch.cuda.synchronize()
-
-    t1 = time.time()
-    dt = t1 - t0
-    tokens_processed = (
-        train_loader.B * train_loader.T * grad_accumulation_steps * ddp_world_size
-    )
-    tokens_per_sec = tokens_processed / dt
-    if master_process:
-        print(
-            f"step: {step} | train loss: {train_loss:.6f} | lr: {lr} |  norm: {norm:.4f} | dt: {dt * 1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
-        )
-        with open(log_file, "a") as f:
-            f.write(f"step: {step}, train loss: {train_loss:.6f}\n")
-
-if use_ddp:
-    dist.destroy_process_group()
+if __name__ == "__main__":
+    arg_parse = argparse.ArgumentParser()
+    arg_parse.add_argument("--config", type=str, default="./config.yml")
+    args = arg_parse.parse_args()
+    main(args.config)

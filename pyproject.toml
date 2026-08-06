@@ -13,4 +13,5 @@ dependencies = [
     "tiktoken>=0.13.0",
     "torch>=2.12.1",
     "transformers>=5.14.1",
+    "wandb>=0.28.1",
 ]

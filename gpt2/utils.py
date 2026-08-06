@@ -1,10 +1,193 @@
 import math
 import os
 import random
+import time
 
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from gpt2.models import GPT, GPTConfig
+
+
+def init_log_file(log_dir, log_file):
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, log_file)
+    with open(log_path, "w"):
+        pass
+
+
+def compute_gradient_accumulation_steps(
+    total_batch_size, micro_batch_size, context_length, ddp_world_size
+):
+    grad_accumulation_steps = total_batch_size // (
+        micro_batch_size * context_length * ddp_world_size
+    )
+
+    assert grad_accumulation_steps > 0
+    return grad_accumulation_steps
+
+
+def get_model(
+    config: dict,
+    use_ddp: bool,
+    ddp_local_rank: int,
+    device: str,
+):
+
+    model = GPT(GPTConfig(vocab_size=config["vocab_size"]))
+
+    model.to(device)
+
+    if use_ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+
+    return model
+
+
+def train_loop(
+    config,
+    model,
+    optimizer,
+    train_loader,
+    val_loader,
+    use_ddp,
+    ddp_world_size,
+    device,
+    master_process,
+    log_dir: str,
+    log_path: str,
+    step: int = 0,
+    wandb=None,
+):
+
+    device_type = device.split(":")[0]
+    grad_accumulation_steps = compute_gradient_accumulation_steps(
+        config["total_batch_size"],
+        config["batch_size"],
+        config["context_length"],
+        ddp_world_size,
+    )
+    if master_process:
+        print(
+            f"Total batch size: {config['total_batch_size']}, gradient accumulation steps: {grad_accumulation_steps}"
+        )
+
+    max_steps = config["max_steps"]
+    eval_interval = config["eval_interval"]
+
+    while step < max_steps:
+        lr = get_cosine_decay_lr(
+            step,
+            config["warmup_steps"],
+            config["max_steps"],
+            config["max_lr"],
+            config["max_lr"] * config["min_lr_factor"],
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+
+        t0 = time.time()
+        last_step = step == max_steps - 1
+
+        model.train()
+        optimizer.zero_grad()
+        train_loss = 0.0
+
+        # train
+        for micro_step in range(grad_accumulation_steps):
+            x, y = train_loader.next_batch()
+            if device_type == "cuda":
+                x, y = (
+                    x.pin_memory().to(device, non_blocking=True),
+                    y.pin_memory().to(device, non_blocking=True),
+                )
+            else:
+                x, y = x.to(device), y.to(device)
+            if use_ddp:
+                model.require_backward_grad_sync = (
+                    micro_step == grad_accumulation_steps - 1
+                )
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                logits = model(x)
+                loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
+            loss = loss / grad_accumulation_steps
+            train_loss += loss.detach()
+
+            loss.backward()
+        if use_ddp:
+            dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
+
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
+        optimizer.step()
+
+        t1 = time.time()
+        dt = t1 - t0
+
+        # eval
+        if step % eval_interval == 0 or last_step:
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss = 0.0
+                for _ in range(config["val_loss_steps"]):
+                    x, y = val_loader.next_batch()
+                    if device_type == "cuda":
+                        x, y = (
+                            x.pin_memory().to(device, non_blocking=True),
+                            y.pin_memory().to(device, non_blocking=True),
+                        )
+                    else:
+                        x, y = x.to(device), y.to(device)
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        logits = model(x)
+                        loss = F.cross_entropy(
+                            logits.view(-1, logits.shape[-1]), y.view(-1)
+                        )
+
+                    val_loss += loss.detach()
+
+                val_loss /= config["val_loss_steps"]
+
+            if use_ddp:
+                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+
+            if wandb is not None:
+                wandb.log(
+                    {
+                        "step": step,
+                        "train/loss": train_loss.item(),
+                        "val/loss": val_loss.item(),
+                        "lr": lr,
+                    }
+                )
+            if master_process:
+                print(f"Validation loss: {val_loss.item():.4f}")
+                with open(log_path, "a") as f:
+                    f.write(
+                        f"step: {step}, train loss: {train_loss.item():.4f}, val_loss = {val_loss.item():.4f}\n"
+                    )
+                if step > 0 and (step % config["ckpt_interval"] == 0 or last_step):
+                    ckpt_path = os.path.join(
+                        log_dir, config["ckpt_filename_format"].format(step=step)
+                    )
+                    save_checkpoint(ckpt_path, model, optimizer, train_loader, step)
+
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+
+        tokens_processed = (
+            train_loader.B * train_loader.T * grad_accumulation_steps * ddp_world_size
+        )
+        tokens_per_sec = tokens_processed / dt
+        if master_process:
+            print(
+                f"step: {step} | train loss: {train_loss.item():.4f} | lr: {lr} |  norm: {norm.item():.4f} | dt: {dt * 1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
+            )
+
+        step += 1
 
 
 def determine_ddp():
@@ -18,6 +201,7 @@ def determine_ddp():
         device = f"cuda:{ddp_local_rank}"
         torch.cuda.set_device(device)
         master_process = ddp_rank == 0
+        print(f"Using DDP with world size {ddp_world_size}")
     else:
         ddp_rank = 0
         ddp_local_rank = 0
@@ -45,14 +229,14 @@ def seed_everything(seed: int = 1337):
         torch.mps.manual_seed(seed)
 
 
-def get_cosine_decay_lr(iteration, warmup_steps, max_steps, max_lr, min_lr):
+def get_cosine_decay_lr(step, warmup_steps, max_steps, max_lr, min_lr):
 
-    if iteration < warmup_steps:
-        return max_lr * (iteration + 1) / warmup_steps
-    if iteration > max_steps:
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+    if step > max_steps:
         return min_lr
 
-    decay_ratio = (iteration - warmup_steps) / (max_steps - warmup_steps)
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
@@ -70,7 +254,7 @@ def save_checkpoint(filepath, model, optimizer, train_loader, step):
         "optimizer": optimizer.state_dict(),
         "dataloader": {
             "current_shard": train_loader.current_shard,
-            "current_position": train_loader.current_position,
+            "base_position": train_loader.base_position,
         },
         "rng_state": {
             "python": random.getstate(),
@@ -83,6 +267,26 @@ def save_checkpoint(filepath, model, optimizer, train_loader, step):
         "step": step,
     }
     torch.save(ckpt, filepath)
+
+
+def load_checkpoint(filepath, model, optimizer, train_loader, device):
+    ckpt = torch.load(filepath, map_location=device)
+
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+
+    train_loader.current_shard = ckpt["dataloader"]["current_shard"]
+    train_loader.base_position = ckpt["dataloader"]["base_position"]
+
+    rng = ckpt["rng_state"]
+    random.setstate(rng["python"])
+    np.random.set_state(rng["numpy"])
+    torch.set_rng_state(rng["torch"])
+    if rng["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(rng["cuda"])
+
+    step = ckpt["step"]
+    return step
 
 
 class DataLoaderLite:
@@ -103,16 +307,17 @@ class DataLoaderLite:
     def reset(self):
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.B * self.T * self.process_rank
+        self.base_position = 0
 
     def next_batch(self):
         B, T = self.B, self.T
-        window = self.tokens[self.current_position : self.current_position + B * T + 1]
+        pos = self.base_position + B * T * self.process_rank
+        window = self.tokens[pos : pos + B * T + 1]
         x = window[:-1].view(B, T)
         y = window[1:].view(B, T)
-        self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+        self.base_position += B * T * self.num_processes
+        if self.base_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * self.process_rank
+            self.base_position = 0
         return x, y
