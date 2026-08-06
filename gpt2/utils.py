@@ -9,7 +9,8 @@ import torch.distributed as dist
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from gpt2.models import GPT, GPTConfig
+from gpt2.configs import GPTConfig
+from gpt2.models import GPT
 
 
 def init_log_file(log_dir, log_file):
@@ -31,13 +32,13 @@ def compute_gradient_accumulation_steps(
 
 
 def get_model(
-    config: dict,
+    config: GPTConfig,
     use_ddp: bool,
     ddp_local_rank: int,
     device: str,
 ):
 
-    model = GPT(GPTConfig(vocab_size=config["vocab_size"]))
+    model = GPT(config)
 
     model.to(device)
 
@@ -48,7 +49,8 @@ def get_model(
 
 
 def train_loop(
-    config,
+    train_config,
+    model_config,
     model,
     optimizer,
     train_loader,
@@ -65,26 +67,26 @@ def train_loop(
 
     device_type = device.split(":")[0]
     grad_accumulation_steps = compute_gradient_accumulation_steps(
-        config["total_batch_size"],
-        config["batch_size"],
-        config["context_length"],
+        train_config.total_batch_size,
+        train_config.batch_size,
+        model_config.context_length,
         ddp_world_size,
     )
     if master_process:
         print(
-            f"Total batch size: {config['total_batch_size']}, gradient accumulation steps: {grad_accumulation_steps}"
+            f"Total batch size: {train_config.total_batch_size}, gradient accumulation steps: {grad_accumulation_steps}"
         )
 
-    max_steps = config["max_steps"]
-    eval_interval = config["eval_interval"]
+    max_steps = train_config.max_steps
+    eval_interval = train_config.eval_interval
 
     while step < max_steps:
         lr = get_cosine_decay_lr(
             step,
-            config["warmup_steps"],
-            config["max_steps"],
-            config["max_lr"],
-            config["max_lr"] * config["min_lr_factor"],
+            train_config.warmup_steps,
+            train_config.max_steps,
+            train_config.max_lr,
+            train_config.max_lr * train_config.min_lr_factor,
         )
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
@@ -123,6 +125,9 @@ def train_loop(
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
         optimizer.step()
 
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+
         t1 = time.time()
         dt = t1 - t0
 
@@ -132,7 +137,7 @@ def train_loop(
             val_loader.reset()
             with torch.no_grad():
                 val_loss = 0.0
-                for _ in range(config["val_loss_steps"]):
+                for _ in range(train_config.val_loss_steps):
                     x, y = val_loader.next_batch()
                     if device_type == "cuda":
                         x, y = (
@@ -149,7 +154,7 @@ def train_loop(
 
                     val_loss += loss.detach()
 
-                val_loss /= config["val_loss_steps"]
+                val_loss /= train_config.val_loss_steps
 
             if use_ddp:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -169,14 +174,15 @@ def train_loop(
                     f.write(
                         f"step: {step}, train loss: {train_loss.item():.4f}, val_loss = {val_loss.item():.4f}\n"
                     )
-                if step > 0 and (step % config["ckpt_interval"] == 0 or last_step):
-                    ckpt_path = os.path.join(
-                        log_dir, config["ckpt_filename_format"].format(step=step)
-                    )
-                    save_checkpoint(ckpt_path, model, optimizer, train_loader, step)
-
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
+        if (
+            master_process
+            and step > 0
+            and (step % train_config.ckpt_interval == 0 or last_step)
+        ):
+            ckpt_path = os.path.join(
+                log_dir, train_config.ckpt_filename_format.format(step=step)
+            )
+            save_checkpoint(ckpt_path, model, optimizer, train_loader, step)
 
         tokens_processed = (
             train_loader.B * train_loader.T * grad_accumulation_steps * ddp_world_size

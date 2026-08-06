@@ -1,22 +1,8 @@
 import math
-from dataclasses import dataclass
 
 import torch
 from torch import nn
 from torch.nn import functional as F
-
-
-@dataclass
-class GPTConfig:
-    context_length: int = 1024
-    vocab_size: int = (
-        50304  # gpt vocab size = 50257, padded to 50304 to make it a multiple of 64
-    )
-    n_layer: int = 12
-    n_head: int = 12
-    n_embed: int = 768
-    dropout: float = 0.0
-    bias: bool = False
 
 
 class LayerNorm(nn.Module):
